@@ -46,6 +46,14 @@ class ChessformerAdapter(nn.Module):
         # Freeze transformer weights (inference only)
         for param in self.transformer.parameters():
             param.requires_grad = False
+        
+        # Add trainable value head on top of transformer features
+        # Use the output dimension from transformer
+        self.value_head = nn.Sequential(
+            nn.Linear(128, 64),  # Match transformer feature dim
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        ).to(device)
     
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -58,7 +66,7 @@ class ChessformerAdapter(nn.Module):
         Returns:
             (logits, values) where:
             - logits: (B, 4100) action logits
-            - values: (B,) dummy value head (all zeros) since transformer doesn't have it
+            - values: (B,) value estimates from trainable value head
         """
         batch_size = obs.shape[0]
         
@@ -82,8 +90,13 @@ class ChessformerAdapter(nn.Module):
         # Convert (B, 64, 2) to (B, 4100) logits
         logits = self._scores_to_logits(output)  # (B, 4100)
         
-        # Dummy value head (transformer doesn't have one)
-        values = torch.zeros(batch_size, device=self.device)
+        # Trainable value head: use mean of transformer output as features
+        with torch.no_grad():
+            features = output.mean(dim=1)  # (B, 2) mean over squares
+            # Expand features to match expected dim
+            features = torch.cat([features, torch.zeros(batch_size, 126, device=self.device)], dim=1)  # (B, 128)
+        
+        values = self.value_head(features).squeeze(-1)  # (B,)
         
         return logits, values
     
@@ -172,7 +185,7 @@ class ChessformerAdapter(nn.Module):
         return full_logits
 
 
-class ChessformerPolicyWrapper:
+class ChessformerPolicyWrapper(nn.Module):
     """Wrapper for inference with ChessformerAdapter."""
     
     def __init__(self, adapter: ChessformerAdapter, device: str = 'cpu'):
@@ -183,6 +196,7 @@ class ChessformerPolicyWrapper:
             adapter: ChessformerAdapter instance
             device: torch device
         """
+        super().__init__()
         self.adapter = adapter.to(device)
         self.device = torch.device(device)
         self.adapter.eval()

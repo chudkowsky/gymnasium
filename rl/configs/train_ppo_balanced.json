@@ -1,0 +1,56 @@
+{
+  "comment": "Balanced training: Shaped rewards + sequential collection. Optimal GPU/CPU utilization.",
+  "training": {
+    "total_steps": 500000,
+    "steps_per_update": 2048,
+    "log_interval": 1,
+    "checkpoint_interval": 5,
+    "device": "cuda",
+    "seed": 42
+  },
+  "ppo": {
+    "learning_rate": 1e-3,
+    "n_epochs": 8,
+    "batch_size": 512,
+    "clip_ratio": 0.2,
+    "entropy_coef": 0.02,
+    "value_coef": 0.5,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "max_grad_norm": 0.5
+  },
+  "rollout": {
+    "num_episodes_per_update": 32,
+    "num_envs": 1,
+    "max_episode_length": 200,
+    "parallel": {
+      "enabled": false,
+      "comment": "Sequential collection - lower CPU overhead"
+    },
+    "shaped_reward": {
+      "enabled": true,
+      "stockfish_depth": 2,
+      "position_reward_coef": 0.01,
+      "terminal_reward_coef": 1.0,
+      "cache_evaluations": true,
+      "comment": "Dense rewards from position evaluation"
+    }
+  },
+  "opponent_pool": {
+    "types": ["random", "stockfish"],
+    "sampling": "uniform",
+    "comment": "Types: 'random', 'stockfish', 'snapshot'.",
+    "stockfish": {
+      "enabled": true,
+      "depth": 5,
+      "movetime_ms": null,
+      "fraction": 0.5,
+      "comment": "Set enabled=true to include Stockfish. movetime_ms overrides depth if set."
+    }
+  },
+  "checkpoints": {
+    "pretrained_path": "data/checkpoints/pretrained.pth",
+    "trained_output_dir": "data/checkpoints",
+    "save_format": "trained_ppo_step_{step}.pth"
+  }
+}

@@ -6,6 +6,13 @@ Usage:
     python train_main.py --config rl/configs/train_ppo.json [--device cpu|cuda]
 """
 
+# MUST be before any multiprocessing imports
+import multiprocessing as mp
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
+
 import argparse
 import json
 import torch
@@ -121,13 +128,34 @@ def main():
     
     # Create trainer
     print("[3/5] Initializing PPO trainer...")
+    
+    # Extract collector configuration
+    rollout_config = config.get('rollout', {})
+    
     trainer = PPOTrainer(
         policy=policy,
         opponent_pool=opponent_pool,
         config=config['ppo'],
         device=device,
+        collector_config=rollout_config,
     )
-    print(f"✓ Trainer ready (lr={config['ppo']['learning_rate']}, clip={config['ppo']['clip_ratio']})")
+    
+    # Print training mode info
+    parallel_enabled = rollout_config.get('parallel', {}).get('enabled', False)
+    shaped_reward_enabled = rollout_config.get('shaped_reward', {}).get('enabled', False)
+    
+    if parallel_enabled and shaped_reward_enabled:
+        print("✓ Training modes: Parallel collection (8 workers) + Shaped rewards")
+    elif parallel_enabled:
+        print(f"✓ Training mode: Parallel collection ({rollout_config.get('parallel', {}).get('num_workers', 4)} workers)")
+    elif shaped_reward_enabled:
+        depth = rollout_config.get('shaped_reward', {}).get('stockfish_depth', 3)
+        coef = rollout_config.get('shaped_reward', {}).get('position_reward_coef', 0.01)
+        print(f"✓ Training mode: Shaped rewards (depth={depth}, coef={coef})")
+    else:
+        print("✓ Training mode: Standard (terminal rewards only)")
+    
+    print(f"   Learning rate: {config['ppo']['learning_rate']}, Clip ratio: {config['ppo']['clip_ratio']}")
     
     # Training loop
     print("[4/5] Starting training loop...")

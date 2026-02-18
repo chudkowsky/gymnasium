@@ -109,6 +109,7 @@ class ChessEnv(gym.Env):
         self.board = chess.Board()
         self.ply_count = 0
         self.move_history = []
+        self.eval_cache = {}  # Cache for Stockfish evaluations
         
         obs = board_to_tensor(self.board, device=self.device).cpu().numpy()
         mask = legal_action_mask(self.board)
@@ -120,12 +121,121 @@ class ChessEnv(gym.Env):
         
         return obs.astype(np.float32), info
     
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+    def evaluate_position(self, board: chess.Board, depth: int = 3) -> float:
+        """
+        Evaluate board position using Stockfish.
+        
+        Args:
+            board: Chess position to evaluate
+            depth: Stockfish search depth (default 3 for speed)
+        
+        Returns:
+            score: position evaluation normalized to [-1, 1]
+                   Positive = white advantage, Negative = black advantage
+        """
+        # Check cache first
+        fen = board.fen()
+        cache_key = (fen, depth)
+        if cache_key in self.eval_cache:
+            return self.eval_cache[cache_key]
+        
+        try:
+            import subprocess
+            import time
+            
+            # Start stockfish process
+            process = subprocess.Popen(
+                ['stockfish'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+            
+            # UCI handshake with timeout
+            process.stdin.write("uci\n")
+            process.stdin.flush()
+            start_time = time.time()
+            while time.time() - start_time < 2:
+                line = process.stdout.readline()
+                if "uciok" in line:
+                    break
+            
+            # Set position and evaluate
+            process.stdin.write(f"position fen {fen}\n")
+            process.stdin.write(f"go depth {depth}\n")
+            process.stdin.flush()
+            
+            # Parse evaluation
+            score_cp = 0
+            best_move_found = False
+            timeout_start = time.time()
+            
+            while time.time() - timeout_start < 5:
+                try:
+                    line = process.stdout.readline(timeout=0.5)
+                except:
+                    line = ""
+                
+                if not line:
+                    continue
+                
+                if "score cp" in line:
+                    parts = line.split()
+                    try:
+                        cp_idx = parts.index("cp") + 1
+                        score_cp = int(parts[cp_idx])
+                    except (ValueError, IndexError):
+                        pass
+                elif "score mate" in line:
+                    # Mate score
+                    parts = line.split()
+                    try:
+                        mate_idx = parts.index("mate") + 1
+                        mate_in = int(parts[mate_idx])
+                        score_cp = 30000 if mate_in > 0 else -30000
+                    except (ValueError, IndexError):
+                        pass
+                elif "bestmove" in line:
+                    best_move_found = True
+                    break
+            
+            try:
+                process.stdin.write("quit\n")
+                process.stdin.flush()
+                process.wait(timeout=1)
+            except:
+                process.kill()
+            
+            # Normalize to [-1, 1] using tanh
+            # Centipawn range: ±300 = substantial advantage, ±1000 = winning
+            normalized = float(np.tanh(score_cp / 300.0))
+            
+            # Cache result
+            self.eval_cache[cache_key] = normalized
+            
+            return normalized
+        
+        except Exception as e:
+            # Fallback: no evaluation available
+            return 0.0
+    
+    def step(
+        self,
+        action: int,
+        use_shaped_reward: bool = False,
+        shaped_reward_coef: float = 0.01,
+        stockfish_depth: int = 3,
+    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
         Execute one step of the environment.
         
         Args:
             action: Action id in [0, N_ACTIONS)
+            use_shaped_reward: whether to use position-based shaped rewards
+            shaped_reward_coef: coefficient for position reward (e.g., 0.01)
+            stockfish_depth: depth for Stockfish evaluation (only if use_shaped_reward=True)
         
         Returns:
             (obs, reward, terminated, truncated, info)
@@ -149,6 +259,11 @@ class ChessEnv(gym.Env):
         # Get SAN before pushing
         move_san = self.board.san(move)
         
+        # Compute position reward (before move)
+        position_reward = 0.0
+        if use_shaped_reward:
+            eval_before = self.evaluate_position(self.board, depth=stockfish_depth)
+        
         # Execute move
         self.board.push(move)
         self.ply_count += 1
@@ -158,29 +273,38 @@ class ChessEnv(gym.Env):
         obs = board_to_tensor(self.board, device=self.device).cpu().numpy()
         mask = legal_action_mask(self.board)
         
+        # Compute position reward (after move)
+        if use_shaped_reward:
+            eval_after = self.evaluate_position(self.board, depth=stockfish_depth)
+            # Improvement in position = reward (from white's perspective)
+            position_reward = (eval_after - eval_before) * shaped_reward_coef
+        
         # Determine termination status
         terminated = self.board.is_game_over(claim_draw=True)
         truncated = self.ply_count >= self.max_plies
         
-        # Compute reward (from white's perspective)
-        reward = 0.0
+        # Compute terminal reward (strong signal)
+        terminal_reward = 0.0
         result = None
         if terminated:
             outcome = self.board.outcome()
             if outcome is None:
                 # Draw by stalemate or other rule
-                reward = 0.0
+                terminal_reward = 0.0
                 result = 'draw'
             elif outcome.winner == chess.WHITE:
-                reward = 1.0
+                terminal_reward = 1.0
                 result = 'white_win'
             elif outcome.winner == chess.BLACK:
-                reward = -1.0
+                terminal_reward = -1.0
                 result = 'black_win'
             else:
                 # Draw
-                reward = 0.0
+                terminal_reward = 0.0
                 result = 'draw'
+        
+        # Combined reward
+        reward = position_reward + terminal_reward
         
         # Build info dict
         info = {
@@ -191,6 +315,8 @@ class ChessEnv(gym.Env):
             'result': result,
             'ply': self.ply_count,
             'truncated_by_ply': truncated and not terminated,
+            'position_reward': position_reward,
+            'terminal_reward': terminal_reward,
         }
         
         return obs.astype(np.float32), float(reward), terminated, truncated, info

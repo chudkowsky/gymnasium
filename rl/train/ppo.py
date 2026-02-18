@@ -6,7 +6,7 @@ import json
 from typing import Dict, Any
 import numpy as np
 
-from rl.rollouts import RolloutCollector
+from rl.rollouts import RolloutCollector, ParallelRolloutCollector
 from rl.opponents import OpponentBase
 from .losses import compute_policy_loss, compute_value_loss, compute_entropy_loss
 
@@ -20,6 +20,7 @@ class PPOTrainer:
         opponent_pool,
         config: Dict[str, Any],
         device: str = "cpu",
+        collector_config: Dict[str, Any] = None,
     ):
         """
         Initialize PPO trainer.
@@ -29,6 +30,7 @@ class PPOTrainer:
             opponent_pool: list of OpponentBase opponents
             config: training configuration dict
             device: torch device
+            collector_config: rollout collection configuration
         """
         self.policy = policy
         self.opponent_pool = opponent_pool
@@ -49,10 +51,42 @@ class PPOTrainer:
         # Optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=self.learning_rate)
         
-        # Collector
-        self.collector = RolloutCollector(
-            policy, opponent_pool, device=device, num_envs=1
-        )
+        # Collector configuration
+        if collector_config is None:
+            collector_config = {}
+        
+        # Extract shaped reward config
+        shaped_reward_config = collector_config.get('shaped_reward', {})
+        use_shaped_reward = shaped_reward_config.get('enabled', False)
+        shaped_reward_coef = shaped_reward_config.get('position_reward_coef', 0.01)
+        stockfish_depth = shaped_reward_config.get('stockfish_depth', 3)
+        
+        # Extract parallel config
+        parallel_config = collector_config.get('parallel', {})
+        use_parallel = parallel_config.get('enabled', False)
+        num_workers = parallel_config.get('num_workers', 4)
+        
+        # Create appropriate collector
+        if use_parallel:
+            self.collector = ParallelRolloutCollector(
+                policy,
+                opponent_pool,
+                device='cpu',  # Workers use CPU
+                num_workers=num_workers,
+                use_shaped_reward=use_shaped_reward,
+                shaped_reward_coef=shaped_reward_coef,
+                stockfish_depth=stockfish_depth,
+            )
+        else:
+            self.collector = RolloutCollector(
+                policy,
+                opponent_pool,
+                device=device,
+                num_envs=1,
+                use_shaped_reward=use_shaped_reward,
+                shaped_reward_coef=shaped_reward_coef,
+                stockfish_depth=stockfish_depth,
+            )
         
         # Logging
         self.num_updates = 0
@@ -61,14 +95,20 @@ class PPOTrainer:
     def train_epoch(self, buffer, num_minibatches: int = 4):
         """
         One PPO update epoch.
-        
+
         Args:
             buffer: RolloutBuffer with transitions
             num_minibatches: number of minibatches to split data into
-            
+
         Returns:
             metrics: dict of training metrics
         """
+        # Use eval mode to disable dropout during training — critical for PPO consistency.
+        # The transformer has 0.5 dropout which would make logprobs inconsistent between
+        # rollout (eval/no_grad) and training (formerly train/grad), causing huge KL.
+        # eval() only disables dropout/batchnorm — it does NOT block gradient computation.
+        self.policy.eval()
+
         data = buffer.get_all()
         if data is None:
             return {}
@@ -120,8 +160,7 @@ class PPOTrainer:
                 advantages_batch = advantages[batch_indices]
                 returns_batch = returns[batch_indices]
                 
-                # Forward pass
-                logits = self.policy(obs_batch)
+                # Forward pass (single call)
                 output = self.policy.forward(obs_batch)
                 if isinstance(output, tuple):
                     logits, values = output
@@ -181,6 +220,7 @@ class PPOTrainer:
         buf_stats = buffer.stats()
         
         # PPO update
+        print(f"Running PPO update (n_epochs={self.n_epochs})...")
         update_metrics = self.train_epoch(buffer)
         
         # Combine metrics

@@ -41,11 +41,11 @@ class ChessformerAdapter(nn.Module):
         super().__init__()
         self.transformer = chessformer_model.to(device)
         self.device = torch.device(device)
-        self.transformer.eval()
+        self.transformer.train()  # Enable training mode for fine-tuning
         
-        # Freeze transformer weights (inference only)
+        # Enable gradient flow through transformer for fine-tuning
         for param in self.transformer.parameters():
-            param.requires_grad = False
+            param.requires_grad = True
         
         # Add trainable value head on top of transformer features
         # Use the output dimension from transformer
@@ -58,131 +58,93 @@ class ChessformerAdapter(nn.Module):
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through adapter.
-        
+
         Args:
             obs: (B, 15, 8, 8) observation tensor [plane representation]
                 or (B, 64) token tensor [direct token format]
-        
+
         Returns:
             (logits, values) where:
             - logits: (B, 4100) action logits
             - values: (B,) value estimates from trainable value head
         """
         batch_size = obs.shape[0]
-        
+
         # If input is 15-plane, convert to tokens
         if obs.dim() == 4 and obs.shape[1:] == (15, 8, 8):
-            # Convert 15-plane to tokens
-            # This is a simplified conversion; real boards would need proper reconstruction
             tokens = self._planes_to_tokens(obs)
         elif obs.dim() == 2 and obs.shape[1] == 64:
-            # Already tokens
             tokens = obs.long()
         else:
             raise ValueError(f"Unexpected obs shape: {obs.shape}")
-        
+
         tokens = tokens.to(self.device)
-        
-        # Forward through transformer
-        with torch.no_grad():
-            output = self.transformer(tokens)  # (B, 64, 2)
-        
+
+        # Forward through transformer — gradients flow for fine-tuning
+        output = self.transformer(tokens)  # (B, 64, 2)
+
         # Convert (B, 64, 2) to (B, 4100) logits
         logits = self._scores_to_logits(output)  # (B, 4100)
-        
-        # Trainable value head: use mean of transformer output as features
-        with torch.no_grad():
-            features = output.mean(dim=1)  # (B, 2) mean over squares
-            # Expand features to match expected dim
-            features = torch.cat([features, torch.zeros(batch_size, 126, device=self.device)], dim=1)  # (B, 128)
-        
+
+        # Value head: use full transformer output reshaped as features
+        # output is (B, 64, 2) -> reshape to (B, 128) for value head
+        features = output.reshape(batch_size, -1)  # (B, 128)
         values = self.value_head(features).squeeze(-1)  # (B,)
-        
+
         return logits, values
     
     def _planes_to_tokens(self, obs: torch.Tensor) -> torch.Tensor:
         """
         Convert 15-plane representation to 64-token representation.
-        
-        This is a heuristic conversion since we lose information in 15-plane format.
-        For accuracy, consider modifying ChessEnv to output tokens directly.
-        
+
+        Planes 0-5:  White pieces (P=1, N=2, B=3, R=4, Q=5, K=6)
+        Planes 6-11: Black pieces (p=7, n=8, b=9, r=10, q=11, k=12)
+        Plane 12+:   Auxiliary (ignored here)
+
         Args:
             obs: (B, 15, 8, 8)
-        
+
         Returns:
-            (B, 64) token indices
+            (B, 64) token indices in [0, 12]
         """
         batch_size = obs.shape[0]
-        tokens = torch.zeros(batch_size, 64, dtype=torch.long, device=obs.device)
-        
-        # Piece mapping: planes 0-11 contain piece placements
-        piece_map = [
-            'P', 'N', 'B', 'R', 'Q', 'K',  # White pieces (planes 0-5)
-            'p', 'n', 'b', 'r', 'q', 'k',  # Black pieces (planes 6-11)
-        ]
-        piece_to_token = {
-            'P': 1, 'N': 2, 'B': 3, 'R': 4, 'Q': 5, 'K': 6,
-            'p': 7, 'n': 8, 'b': 9, 'r': 10, 'q': 11, 'k': 12,
-        }
-        
-        for b in range(batch_size):
-            for sq in range(64):
-                row = sq // 8
-                col = sq % 8
-                
-                # Check each piece plane
-                found = False
-                for plane_idx, piece_char in enumerate(piece_map):
-                    if obs[b, plane_idx, row, col] > 0.5:
-                        tokens[b, sq] = piece_to_token[piece_char]
-                        found = True
-                        break
-                
-                if not found:
-                    tokens[b, sq] = 0  # Empty
-        
+
+        # (B, 12, 8, 8) -> (B, 12, 64)
+        piece_planes = obs[:, :12, :, :].reshape(batch_size, 12, 64)
+
+        # Token values: plane 0 -> 1, plane 1 -> 2, ..., plane 11 -> 12
+        token_ids = torch.arange(1, 13, device=obs.device, dtype=torch.long).view(1, 12, 1)
+
+        # For each square, sum token_id where the plane is 1 (at most one piece per square)
+        tokens = ((piece_planes > 0.5).long() * token_ids).sum(dim=1)  # (B, 64)
+
         return tokens
     
     def _scores_to_logits(self, scores: torch.Tensor) -> torch.Tensor:
         """
         Convert (B, 64, 2) transformer output to (B, 4100) action logits.
-        
-        For each move action i = from*64 + to:
-            logit[i] = score[from, 0] + score[to, 1]
-        
+
+        For each base move action i = from*64 + to:
+            logit[i] = from_score[from] + to_score[to]
+
         Args:
             scores: (B, 64, 2) with [from_scores, to_scores]
-        
+
         Returns:
             (B, 4100) logits over all actions
         """
-        batch_size = scores.shape[0]
-        device = scores.device
-        
-        # Extract from and to scores
         from_scores = scores[:, :, 0]  # (B, 64)
         to_scores = scores[:, :, 1]    # (B, 64)
-        
-        # Compute logits for all base moves
-        # logit[from*64 + to] = from_score[from] + to_score[to]
-        logits = torch.zeros(batch_size, N_BASE_MOVES, device=device)
-        
-        for from_sq in range(64):
-            for to_sq in range(64):
-                if from_sq != to_sq:
-                    action = from_sq * 64 + to_sq
-                    logits[:, action] = from_scores[:, from_sq] + to_scores[:, to_sq]
-        
-        # For promotion moves: use best pawn promotion available
-        # Simple heuristic: use max of (from_pawn, to_promotion_target)
-        promo_logits = torch.max(from_scores, dim=1)[0]  # (B,)
-        promo_logits = promo_logits.unsqueeze(1).expand(batch_size, 4)
-        
-        # Concatenate: (B, 4096 + 4)
-        full_logits = torch.cat([logits, promo_logits], dim=1)  # (B, 4100)
-        
-        return full_logits
+
+        # Vectorized outer sum: base_logits[b, from, to] = from_scores[b, from] + to_scores[b, to]
+        # (B, 64, 1) + (B, 1, 64) -> (B, 64, 64) -> (B, 4096)
+        base_logits = from_scores.unsqueeze(2) + to_scores.unsqueeze(1)
+        base_logits = base_logits.reshape(scores.shape[0], N_BASE_MOVES)  # (B, 4096)
+
+        # Promotion logits: use max from_score as proxy for all 4 promotion types
+        promo_logits = from_scores.max(dim=1, keepdim=True)[0].expand(-1, 4)  # (B, 4)
+
+        return torch.cat([base_logits, promo_logits], dim=1)  # (B, 4100)
 
 
 class ChessformerPolicyWrapper(nn.Module):

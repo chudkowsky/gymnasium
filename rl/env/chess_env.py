@@ -79,7 +79,11 @@ class ChessEnv(gym.Env):
         self.board = None
         self.ply_count = 0
         self.move_history = []
-        
+
+        # Persistent Stockfish engine (lazy init, reused across all evaluations)
+        self._engine = None
+        self.eval_cache = {}
+
         # Seed for reproducibility
         if seed is not None:
             self.seed(seed)
@@ -109,7 +113,7 @@ class ChessEnv(gym.Env):
         self.board = chess.Board()
         self.ply_count = 0
         self.move_history = []
-        self.eval_cache = {}  # Cache for Stockfish evaluations
+        self.eval_cache = {}  # Clear cache each episode
         
         obs = board_to_tensor(self.board, device=self.device).cpu().numpy()
         mask = legal_action_mask(self.board)
@@ -121,104 +125,42 @@ class ChessEnv(gym.Env):
         
         return obs.astype(np.float32), info
     
+    def _get_engine(self):
+        """Return the persistent Stockfish engine, starting it if needed."""
+        if self._engine is None:
+            self._engine = chess.engine.SimpleEngine.popen_uci('stockfish')
+            self._engine.configure({'Threads': 1})
+        return self._engine
+
     def evaluate_position(self, board: chess.Board, depth: int = 3) -> float:
         """
-        Evaluate board position using Stockfish.
-        
-        Args:
-            board: Chess position to evaluate
-            depth: Stockfish search depth (default 3 for speed)
-        
+        Evaluate board position using a persistent Stockfish process.
+
         Returns:
-            score: position evaluation normalized to [-1, 1]
-                   Positive = white advantage, Negative = black advantage
+            score normalised to [-1, 1] from white's perspective.
         """
-        # Check cache first
         fen = board.fen()
         cache_key = (fen, depth)
         if cache_key in self.eval_cache:
             return self.eval_cache[cache_key]
-        
+
         try:
-            import subprocess
-            import time
-            
-            # Start stockfish process
-            process = subprocess.Popen(
-                ['stockfish'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1
-            )
-            
-            # UCI handshake with timeout
-            process.stdin.write("uci\n")
-            process.stdin.flush()
-            start_time = time.time()
-            while time.time() - start_time < 2:
-                line = process.stdout.readline()
-                if "uciok" in line:
-                    break
-            
-            # Set position and evaluate
-            process.stdin.write(f"position fen {fen}\n")
-            process.stdin.write(f"go depth {depth}\n")
-            process.stdin.flush()
-            
-            # Parse evaluation
-            score_cp = 0
-            best_move_found = False
-            timeout_start = time.time()
-            
-            while time.time() - timeout_start < 5:
-                try:
-                    line = process.stdout.readline(timeout=0.5)
-                except:
-                    line = ""
-                
-                if not line:
-                    continue
-                
-                if "score cp" in line:
-                    parts = line.split()
-                    try:
-                        cp_idx = parts.index("cp") + 1
-                        score_cp = int(parts[cp_idx])
-                    except (ValueError, IndexError):
-                        pass
-                elif "score mate" in line:
-                    # Mate score
-                    parts = line.split()
-                    try:
-                        mate_idx = parts.index("mate") + 1
-                        mate_in = int(parts[mate_idx])
-                        score_cp = 30000 if mate_in > 0 else -30000
-                    except (ValueError, IndexError):
-                        pass
-                elif "bestmove" in line:
-                    best_move_found = True
-                    break
-            
-            try:
-                process.stdin.write("quit\n")
-                process.stdin.flush()
-                process.wait(timeout=1)
-            except:
-                process.kill()
-            
-            # Normalize to [-1, 1] using tanh
-            # Centipawn range: ±300 = substantial advantage, ±1000 = winning
-            normalized = float(np.tanh(score_cp / 300.0))
-            
-            # Cache result
+            engine = self._get_engine()
+            info = engine.analyse(board, chess.engine.Limit(depth=depth))
+            score = info['score'].white()
+
+            if score.is_mate():
+                cp = 30000 if score.mate() > 0 else -30000
+            else:
+                cp = score.score(mate_score=30000)
+
+            normalized = float(np.tanh(cp / 300.0))
             self.eval_cache[cache_key] = normalized
-            
             return normalized
-        
-        except Exception as e:
-            # Fallback: no evaluation available
+
+        except Exception:
+            # Engine died — clear it so it restarts next call
+            self._engine = None
             return 0.0
     
     def step(
@@ -329,7 +271,12 @@ class ChessEnv(gym.Env):
     
     def close(self):
         """Clean up resources."""
-        pass
+        if self._engine is not None:
+            try:
+                self._engine.quit()
+            except Exception:
+                pass
+            self._engine = None
     
     def get_board(self) -> chess.Board:
         """Return a copy of the current board."""

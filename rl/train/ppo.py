@@ -55,17 +55,25 @@ class PPOTrainer:
         if collector_config is None:
             collector_config = {}
         
+        # Extract accuracy reward config (takes precedence over shaped reward)
+        accuracy_reward_config = collector_config.get('accuracy_reward', {})
+        use_accuracy_reward = accuracy_reward_config.get('enabled', False)
+        accuracy_stockfish_depth = accuracy_reward_config.get('stockfish_depth', 5)
+
         # Extract shaped reward config
         shaped_reward_config = collector_config.get('shaped_reward', {})
-        use_shaped_reward = shaped_reward_config.get('enabled', False)
+        use_shaped_reward = shaped_reward_config.get('enabled', False) and not use_accuracy_reward
         shaped_reward_coef = shaped_reward_config.get('position_reward_coef', 0.01)
-        stockfish_depth = shaped_reward_config.get('stockfish_depth', 3)
-        
+        shaped_stockfish_depth = shaped_reward_config.get('stockfish_depth', 3)
+
+        # Unified Stockfish depth: accuracy reward uses its own depth
+        stockfish_depth = accuracy_stockfish_depth if use_accuracy_reward else shaped_stockfish_depth
+
         # Extract parallel config
         parallel_config = collector_config.get('parallel', {})
         use_parallel = parallel_config.get('enabled', False)
         num_workers = parallel_config.get('num_workers', 4)
-        
+
         # Create appropriate collector
         if use_parallel:
             self.collector = ParallelRolloutCollector(
@@ -76,6 +84,7 @@ class PPOTrainer:
                 use_shaped_reward=use_shaped_reward,
                 shaped_reward_coef=shaped_reward_coef,
                 stockfish_depth=stockfish_depth,
+                use_accuracy_reward=use_accuracy_reward,
             )
         else:
             self.collector = RolloutCollector(
@@ -86,6 +95,7 @@ class PPOTrainer:
                 use_shaped_reward=use_shaped_reward,
                 shaped_reward_coef=shaped_reward_coef,
                 stockfish_depth=stockfish_depth,
+                use_accuracy_reward=use_accuracy_reward,
             )
         
         # Logging

@@ -142,18 +142,25 @@ def main():
     
     # Print training mode info
     parallel_enabled = rollout_config.get('parallel', {}).get('enabled', False)
-    shaped_reward_enabled = rollout_config.get('shaped_reward', {}).get('enabled', False)
-    
-    if parallel_enabled and shaped_reward_enabled:
-        print("✓ Training modes: Parallel collection (8 workers) + Shaped rewards")
-    elif parallel_enabled:
-        print(f"✓ Training mode: Parallel collection ({rollout_config.get('parallel', {}).get('num_workers', 4)} workers)")
+    accuracy_reward_enabled = rollout_config.get('accuracy_reward', {}).get('enabled', False)
+    shaped_reward_enabled = rollout_config.get('shaped_reward', {}).get('enabled', False) and not accuracy_reward_enabled
+
+    reward_label = ""
+    if accuracy_reward_enabled:
+        depth = rollout_config.get('accuracy_reward', {}).get('stockfish_depth', 5)
+        reward_label = f"Accuracy reward (depth={depth})"
     elif shaped_reward_enabled:
         depth = rollout_config.get('shaped_reward', {}).get('stockfish_depth', 3)
         coef = rollout_config.get('shaped_reward', {}).get('position_reward_coef', 0.01)
-        print(f"✓ Training mode: Shaped rewards (depth={depth}, coef={coef})")
+        reward_label = f"Shaped rewards (depth={depth}, coef={coef})"
     else:
-        print("✓ Training mode: Standard (terminal rewards only)")
+        reward_label = "Terminal reward only (+1/0/-1)"
+
+    if parallel_enabled:
+        nw = rollout_config.get('parallel', {}).get('num_workers', 4)
+        print(f"✓ Training mode: Parallel collection ({nw} workers) + {reward_label}")
+    else:
+        print(f"✓ Training mode: {reward_label}")
     
     print(f"   Learning rate: {config['ppo']['learning_rate']}, Clip ratio: {config['ppo']['clip_ratio']}")
     

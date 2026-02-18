@@ -24,17 +24,20 @@ from .buffers import RolloutBuffer, Transition
 def collect_single_episode_worker(args):
     """
     Collect one episode in subprocess.
-    
+
     This function is pickled and sent to worker process.
-    
+
     Args:
-        args: tuple of (policy_state_dict, opponent_config, device, seed, 
-                       use_shaped_reward, shaped_reward_coef, stockfish_depth)
-    
+        args: tuple of (policy_state_dict, opponent_config, device, seed,
+                       use_shaped_reward, shaped_reward_coef, stockfish_depth,
+                       use_accuracy_reward)
+
     Returns:
         tuple: (transitions_list, total_return, episode_length)
     """
-    policy_state, opponent_config, device, seed, use_shaped_reward, shaped_reward_coef, stockfish_depth = args
+    (policy_state, opponent_config, device, seed,
+     use_shaped_reward, shaped_reward_coef, stockfish_depth,
+     use_accuracy_reward) = args
     
     # Suppress Stockfish output
     import subprocess
@@ -109,12 +112,13 @@ def collect_single_episode_worker(args):
                     'mask': mask.copy(),
                 })
                 
-                # Step with shaped rewards
+                # Step with configured reward mode
                 obs_next, reward, terminated, truncated, info = env.step(
                     action,
                     use_shaped_reward=use_shaped_reward,
                     shaped_reward_coef=shaped_reward_coef,
                     stockfish_depth=stockfish_depth,
+                    use_accuracy_reward=use_accuracy_reward,
                 )
                 done = terminated or truncated
                 total_return += reward
@@ -148,18 +152,20 @@ class ParallelRolloutCollector:
         use_shaped_reward: bool = False,
         shaped_reward_coef: float = 0.01,
         stockfish_depth: int = 3,
+        use_accuracy_reward: bool = False,
     ):
         """
         Initialize parallel rollout collector.
-        
+
         Args:
             policy: agent policy network
             opponent_pool: list of opponent instances
             device: torch device (main process)
             num_workers: number of worker processes
-            use_shaped_reward: whether to use Stockfish-based rewards
+            use_shaped_reward: whether to use Stockfish eval-delta rewards
             shaped_reward_coef: coefficient for position rewards
             stockfish_depth: Stockfish depth for evaluation
+            use_accuracy_reward: use per-move accuracy reward instead of terminal
         """
         self.policy = policy
         self.opponent_pool = opponent_pool
@@ -168,6 +174,7 @@ class ParallelRolloutCollector:
         self.use_shaped_reward = use_shaped_reward
         self.shaped_reward_coef = shaped_reward_coef
         self.stockfish_depth = stockfish_depth
+        self.use_accuracy_reward = use_accuracy_reward
     
     def collect_rollouts(self, num_episodes: int = 32) -> RolloutBuffer:
         """Collect episodes in parallel."""
@@ -202,6 +209,7 @@ class ParallelRolloutCollector:
                 self.use_shaped_reward,
                 self.shaped_reward_coef,
                 self.stockfish_depth,
+                self.use_accuracy_reward,
             ))
         
         # Collect in parallel using spawn method

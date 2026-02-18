@@ -21,18 +21,20 @@ class RolloutCollector:
         use_shaped_reward: bool = False,
         shaped_reward_coef: float = 0.01,
         stockfish_depth: int = 3,
+        use_accuracy_reward: bool = False,
     ):
         """
         Initialize rollout collector.
-        
+
         Args:
             policy: agent policy for sampling actions
             opponent_pool: list of opponent instances
             device: torch device
             num_envs: number of parallel environments (currently fixed at 1)
-            use_shaped_reward: whether to use Stockfish-based position rewards
+            use_shaped_reward: whether to use Stockfish eval-delta rewards
             shaped_reward_coef: coefficient for position rewards (e.g., 0.01)
             stockfish_depth: Stockfish search depth for position evaluation
+            use_accuracy_reward: use per-move accuracy reward instead of terminal
         """
         self.policy = policy
         self.opponent_pool = opponent_pool
@@ -41,6 +43,7 @@ class RolloutCollector:
         self.use_shaped_reward = use_shaped_reward
         self.shaped_reward_coef = shaped_reward_coef
         self.stockfish_depth = stockfish_depth
+        self.use_accuracy_reward = use_accuracy_reward
         
         # For now, simple single-env collection
         self.env = ChessEnv()
@@ -101,6 +104,7 @@ class RolloutCollector:
                     use_shaped_reward=self.use_shaped_reward,
                     shaped_reward_coef=self.shaped_reward_coef,
                     stockfish_depth=self.stockfish_depth,
+                    use_accuracy_reward=self.use_accuracy_reward,
                 )
                 done = terminated or truncated
                 total_return += reward

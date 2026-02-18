@@ -20,8 +20,12 @@
   "rollout": {
     "num_episodes_per_update": 32,
     "max_episode_length": 300,
-    "shaped_reward": {
+    "accuracy_reward": {
       "enabled": true,
+      "stockfish_depth": 5
+    },
+    "shaped_reward": {
+      "enabled": false,
       "stockfish_depth": 3,
       "position_reward_coef": 0.01,
       "terminal_reward_coef": 1.0

@@ -4,12 +4,17 @@ Chess environment for Gymnasium.
 Implements gym.Env interface for chess RL training.
 - Observation: 15-plane tensor (pieces + side-to-move + auxiliary)
 - Action space: 4100 discrete actions (base moves + promotions)
-- Reward: +1 win, 0 draw, -1 loss (white perspective)
+- Reward modes:
+    terminal (default): +1 win, 0 draw, -1 loss (white perspective)
+    shaped: terminal + Stockfish eval delta * coef
+    accuracy: per-move accuracy in [0, 1] based on centipawn loss vs best move
 """
 
+import math
 import gymnasium as gym
 from gymnasium import spaces
 import chess
+import chess.engine
 import numpy as np
 import torch
 from typing import Optional, Tuple, Dict, Any
@@ -141,7 +146,7 @@ class ChessEnv(gym.Env):
             score normalised to [-1, 1] from white's perspective.
         """
         fen = board.fen()
-        cache_key = (fen, depth)
+        cache_key = (fen, depth, 'norm')
         if cache_key in self.eval_cache:
             return self.eval_cache[cache_key]
 
@@ -163,6 +168,61 @@ class ChessEnv(gym.Env):
             # Engine died — clear it so it restarts next call
             self._engine = None
             return 0.0
+
+    def _evaluate_cp(self, board: chess.Board, depth: int = 5) -> float:
+        """
+        Evaluate board position, returning raw centipawns from white's perspective.
+        Used for accuracy reward computation.
+        """
+        fen = board.fen()
+        cache_key = (fen, depth, 'cp')
+        if cache_key in self.eval_cache:
+            return self.eval_cache[cache_key]
+
+        try:
+            engine = self._get_engine()
+            info = engine.analyse(board, chess.engine.Limit(depth=depth))
+            score = info['score'].white()
+
+            if score.is_mate():
+                cp = 30000.0 if score.mate() > 0 else -30000.0
+            else:
+                cp = float(score.score(mate_score=30000))
+
+            self.eval_cache[cache_key] = cp
+            return cp
+
+        except Exception:
+            self._engine = None
+            return 0.0
+
+    @staticmethod
+    def _accuracy_from_cp(best_cp: float, played_cp: float) -> float:
+        """
+        Compute move accuracy in [0, 1] using the Chess.com accuracy formula.
+
+        Converts centipawn scores to win percentages first (since win% is a
+        nonlinear function of cp), then applies:
+            accuracy = 103.1668 * exp(-0.04354 * win%_loss) - 3.1668
+
+        Args:
+            best_cp: Stockfish eval of the position before the move (centipawns,
+                     white's perspective) — this equals the best-move value.
+            played_cp: Stockfish eval after the agent's move (centipawns,
+                       white's perspective).
+
+        Examples (from an equal position, played_cp = best_cp - loss):
+            0 cp loss   → ~1.00 (perfect)
+            50 cp loss  → ~0.81
+            200 cp loss → ~0.45
+            600 cp loss → ~0.15
+        """
+        def win_pct(cp: float) -> float:
+            return 100.0 / (1.0 + math.exp(-0.00368208 * cp))
+
+        win_loss = max(0.0, win_pct(best_cp) - win_pct(played_cp))
+        raw = 103.1668 * math.exp(-0.04354 * win_loss) - 3.1668
+        return float(np.clip(raw / 100.0, 0.0, 1.0))
     
     def step(
         self,
@@ -170,19 +230,30 @@ class ChessEnv(gym.Env):
         use_shaped_reward: bool = False,
         shaped_reward_coef: float = 0.01,
         stockfish_depth: int = 3,
+        use_accuracy_reward: bool = False,
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
         Execute one step of the environment.
-        
+
+        Reward modes (mutually exclusive; accuracy takes precedence):
+            use_accuracy_reward=True:
+                Per-move accuracy in [0, 1] based on centipawn loss vs Stockfish best
+                move. No terminal reward. Requires two Stockfish calls per agent move.
+            use_shaped_reward=True:
+                terminal reward + Stockfish eval delta * shaped_reward_coef.
+            default:
+                terminal reward only (+1 win, 0 draw, -1 loss).
+
         Args:
             action: Action id in [0, N_ACTIONS)
-            use_shaped_reward: whether to use position-based shaped rewards
-            shaped_reward_coef: coefficient for position reward (e.g., 0.01)
-            stockfish_depth: depth for Stockfish evaluation (only if use_shaped_reward=True)
-        
+            use_shaped_reward: enable Stockfish eval-delta reward
+            shaped_reward_coef: coefficient for shaped position reward
+            stockfish_depth: Stockfish search depth for evaluation
+            use_accuracy_reward: enable per-move accuracy reward (overrides shaped)
+
         Returns:
             (obs, reward, terminated, truncated, info)
-        
+
         Raises:
             ValueError: if action is illegal
         """
@@ -202,9 +273,16 @@ class ChessEnv(gym.Env):
         # Get SAN before pushing
         move_san = self.board.san(move)
         
-        # Compute position reward (before move — reuse cached value from previous step)
+        # Accuracy reward: evaluate position (= best-move eval) BEFORE the move.
+        # We always call fresh — _prev_eval is not valid here because the opponent
+        # has moved since the last agent step, changing the position.
+        best_cp = None
+        if use_accuracy_reward:
+            best_cp = self._evaluate_cp(self.board, depth=stockfish_depth)
+
+        # Shaped reward: reuse cached eval from previous agent step
         position_reward = 0.0
-        if use_shaped_reward:
+        if use_shaped_reward and not use_accuracy_reward:
             if self._prev_eval is None:
                 self._prev_eval = self.evaluate_position(self.board, depth=stockfish_depth)
             eval_before = self._prev_eval
@@ -218,39 +296,55 @@ class ChessEnv(gym.Env):
         obs = board_to_tensor(self.board, device=self.device).cpu().numpy()
         mask = legal_action_mask(self.board)
 
-        # Compute position reward (after move)
-        if use_shaped_reward:
-            eval_after = self.evaluate_position(self.board, depth=stockfish_depth)
-            position_reward = (eval_after - eval_before) * shaped_reward_coef
-            self._prev_eval = eval_after  # Cache for next step
-        
         # Determine termination status
         terminated = self.board.is_game_over(claim_draw=True)
         truncated = self.ply_count >= self.max_plies
-        
-        # Compute terminal reward (strong signal)
+
+        # Compute reward
+        accuracy_reward = None
         terminal_reward = 0.0
         result = None
-        if terminated:
+
+        if use_accuracy_reward:
+            # Per-move accuracy in [0, 1]; no terminal signal
+            played_cp = self._evaluate_cp(self.board, depth=stockfish_depth)
+            accuracy_reward = self._accuracy_from_cp(best_cp, played_cp)
+            reward = accuracy_reward
+        else:
+            # Terminal reward
+            if terminated:
+                outcome = self.board.outcome()
+                if outcome is None:
+                    result = 'draw'
+                elif outcome.winner == chess.WHITE:
+                    terminal_reward = 1.0
+                    result = 'white_win'
+                elif outcome.winner == chess.BLACK:
+                    terminal_reward = -1.0
+                    result = 'black_win'
+                else:
+                    result = 'draw'
+
+            # Shaped reward (eval delta)
+            if use_shaped_reward:
+                eval_after = self.evaluate_position(self.board, depth=stockfish_depth)
+                position_reward = (eval_after - eval_before) * shaped_reward_coef
+                self._prev_eval = eval_after
+
+            reward = position_reward + terminal_reward
+
+        if terminated and result is None:
+            # Determine result string for accuracy-reward mode too
             outcome = self.board.outcome()
             if outcome is None:
-                # Draw by stalemate or other rule
-                terminal_reward = 0.0
                 result = 'draw'
             elif outcome.winner == chess.WHITE:
-                terminal_reward = 1.0
                 result = 'white_win'
             elif outcome.winner == chess.BLACK:
-                terminal_reward = -1.0
                 result = 'black_win'
             else:
-                # Draw
-                terminal_reward = 0.0
                 result = 'draw'
-        
-        # Combined reward
-        reward = position_reward + terminal_reward
-        
+
         # Build info dict
         info = {
             'fen': self.board.fen(),
@@ -262,6 +356,7 @@ class ChessEnv(gym.Env):
             'truncated_by_ply': truncated and not terminated,
             'position_reward': position_reward,
             'terminal_reward': terminal_reward,
+            'accuracy_reward': accuracy_reward,
         }
         
         return obs.astype(np.float32), float(reward), terminated, truncated, info

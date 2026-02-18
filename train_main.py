@@ -42,6 +42,12 @@ def main():
         default='data/checkpoints',
         help='Directory to save checkpoints'
     )
+    parser.add_argument(
+        '--stockfish-depth',
+        type=int,
+        default=None,
+        help='Stockfish search depth (overrides config). E.g., --stockfish-depth 15'
+    )
     args = parser.parse_args()
     
     # Load config
@@ -86,8 +92,11 @@ def main():
         try:
             from rl.opponents import StockfishOpponent
             sf_config = config['opponent_pool'].get('stockfish', {})
-            sf_depth = sf_config.get('depth', 10)
+            
+            # Use command-line arg if provided, otherwise use config
+            sf_depth = args.stockfish_depth if args.stockfish_depth is not None else sf_config.get('depth', 10)
             sf_movetime = sf_config.get('movetime_ms', None)
+            
             stockfish_opp = StockfishOpponent(depth=sf_depth, movetime_ms=sf_movetime)
             opponent_pool.append(stockfish_opp)
             print(f"  • StockfishOpponent (depth={sf_depth})")

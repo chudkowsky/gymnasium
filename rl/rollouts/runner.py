@@ -58,12 +58,13 @@ class RolloutCollector:
         done = False
         
         while not done:
-            obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
             mask = legal_action_mask(self.env.board)
-            mask_tensor = torch.tensor(mask, dtype=torch.float32).unsqueeze(0).to(self.device)
             
-            # Agent's turn
-            if agent_perspective == self.env.board.turn:
+            # Agent's turn (white)
+            if self.env.board.turn == chess.WHITE:
+                obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+                mask_tensor = torch.tensor(mask, dtype=torch.float32).unsqueeze(0).to(self.device)
+                
                 with torch.no_grad():
                     output = self.policy.forward(obs_tensor)
                     if isinstance(output, tuple):
@@ -81,42 +82,30 @@ class RolloutCollector:
                 
                 # Sample action
                 action = torch.multinomial(probs.squeeze(0), num_samples=1).item()
-                logprob = torch.log(probs[0, action]).item()
+                logprob = torch.log(probs[0, action] + 1e-10).item()
+                
+                # Store agent's transition BEFORE stepping
+                transition = Transition(
+                    obs=obs,
+                    action=action,
+                    reward=0.0,  # Will be updated at end
+                    next_obs=obs,  # Placeholder
+                    done=False,
+                    logprob=logprob,
+                    value=value.item() if isinstance(value, torch.Tensor) else 0.0,
+                    mask=mask,
+                )
+                buffer.add(transition)
                 
                 obs_next, reward, terminated, truncated, info_next = self.env.step(action)
                 done = terminated or truncated
-                
-                # Track from agent perspective
-                if not done:
-                    # Track return from agent's side
-                    total_return += reward if agent_perspective == 0 else -reward
+                total_return += reward
             else:
-                # Opponent's turn
+                # Opponent's turn (black)
                 action = opponent.get_action(self.env.board)
                 obs_next, reward, terminated, truncated, info_next = self.env.step(action)
                 done = terminated or truncated
-                
-                # Track return from agent perspective
-                total_return += reward if agent_perspective == 0 else -reward
-                action = -1  # Don't store opponent actions
-                logprob = 0.0
-                value = torch.tensor([[0.0]], device=self.device)
-            
-            # Store only agent actions
-            if agent_perspective == self.env.board.turn or (agent_perspective == 0 and self.env.board.turn):
-                # Agent's transition (store only when agent acts)
-                if action >= 0:
-                    transition = Transition(
-                        obs=obs,
-                        action=action,
-                        reward=reward,
-                        next_obs=obs_next,
-                        done=done,
-                        logprob=logprob,
-                        value=value.item() if isinstance(value, torch.Tensor) else 0.0,
-                        mask=mask,
-                    )
-                    buffer.add(transition)
+                total_return -= reward  # Opponent's reward is negative for agent
             
             obs = obs_next
             episode_length += 1

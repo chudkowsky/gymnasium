@@ -11,7 +11,7 @@
   "ppo": {
     "learning_rate": 3e-4,
     "n_epochs": 3,
-    "batch_size": 64,
+    "batch_size": 128,
     "clip_ratio": 0.2,
     "entropy_coef": 0.01,
     "value_coef": 0.5,
@@ -30,7 +30,7 @@
     "comment": "Includes both random and Stockfish opponents for curriculum learning",
     "stockfish": {
       "enabled": true,
-      "depth": 10,
+      "depth": 7,
       "movetime_ms": null,
       "fraction": 0.5,
       "comment": "depth=10 balances strength vs speed. Adjust for CPU/GPU availability."

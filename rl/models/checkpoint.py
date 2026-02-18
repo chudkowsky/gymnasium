@@ -3,12 +3,17 @@ Model checkpoint loader and policy wrapper.
 
 This module handles loading pretrained transformer checkpoints
 and provides inference utilities.
+
+Supports both:
+- SimpleTransformerPolicy (placeholder for testing)
+- ChessTransformer (your real pretrained model via adapter)
 """
 
 import torch
 import torch.nn as nn
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -74,6 +79,39 @@ class SimpleTransformerPolicy(nn.Module):
 
 class CheckpointLoader:
     """Load and manage model checkpoints."""
+    
+    @staticmethod
+    def load_chessformer(
+        checkpoint_path: str = 'data/checkpoints/pretrained.pth',
+        device: str = 'cpu'
+    ):
+        """
+        Load real ChessTransformer model with adapter.
+        
+        Args:
+            checkpoint_path: Path to .pth checkpoint
+            device: torch device
+        
+        Returns:
+            ChessformerPolicyWrapper ready for inference
+        """
+        from .chessformer_adapter import ChessformerAdapter, ChessformerPolicyWrapper
+        
+        # Import ChessTransformer (from chessformer repo)
+        sys.path.insert(0, '/home/mateusz/dev/chessformer')
+        from chessformer import ChessTransformer
+        
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        # Load model
+        model = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        
+        # Create adapter
+        adapter = ChessformerAdapter(model, device=device)
+        
+        # Return policy wrapper
+        return ChessformerPolicyWrapper(adapter, device=device)
     
     @staticmethod
     def load_checkpoint(

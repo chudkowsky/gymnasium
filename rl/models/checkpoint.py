@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -96,9 +95,6 @@ class CheckpointLoader:
             ChessformerPolicyWrapper ready for inference
         """
         from .chessformer_adapter import ChessformerAdapter, ChessformerPolicyWrapper
-        
-        # Import ChessTransformer (from chessformer repo)
-        sys.path.insert(0, '/home/mateusz/dev/chessformer')
         from chessformer import ChessTransformer
         
         if not os.path.exists(checkpoint_path):

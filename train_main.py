@@ -82,6 +82,18 @@ def main():
         opponent_pool.append(RandomOpponent())
         print("  • RandomOpponent (random legal moves)")
     
+    if 'stockfish' in opponent_types or config['opponent_pool'].get('stockfish', {}).get('enabled', False):
+        try:
+            from rl.opponents import StockfishOpponent
+            sf_config = config['opponent_pool'].get('stockfish', {})
+            sf_depth = sf_config.get('depth', 10)
+            sf_movetime = sf_config.get('movetime_ms', None)
+            stockfish_opp = StockfishOpponent(depth=sf_depth, movetime_ms=sf_movetime)
+            opponent_pool.append(stockfish_opp)
+            print(f"  • StockfishOpponent (depth={sf_depth})")
+        except Exception as e:
+            print(f"  ✗ Failed to initialize Stockfish: {e}")
+    
     if 'snapshot' in opponent_types:
         # Add snapshot opponents if any checkpoints exist
         snapshot_dir = Path(config['checkpoints'].get('trained_output_dir', 'data/checkpoints'))

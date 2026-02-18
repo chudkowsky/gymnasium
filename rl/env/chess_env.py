@@ -114,6 +114,7 @@ class ChessEnv(gym.Env):
         self.ply_count = 0
         self.move_history = []
         self.eval_cache = {}  # Clear cache each episode
+        self._prev_eval = None  # Cache last eval_after as next eval_before
         
         obs = board_to_tensor(self.board, device=self.device).cpu().numpy()
         mask = legal_action_mask(self.board)
@@ -201,25 +202,27 @@ class ChessEnv(gym.Env):
         # Get SAN before pushing
         move_san = self.board.san(move)
         
-        # Compute position reward (before move)
+        # Compute position reward (before move — reuse cached value from previous step)
         position_reward = 0.0
         if use_shaped_reward:
-            eval_before = self.evaluate_position(self.board, depth=stockfish_depth)
-        
+            if self._prev_eval is None:
+                self._prev_eval = self.evaluate_position(self.board, depth=stockfish_depth)
+            eval_before = self._prev_eval
+
         # Execute move
         self.board.push(move)
         self.ply_count += 1
         self.move_history.append(move)
-        
+
         # Get new observation
         obs = board_to_tensor(self.board, device=self.device).cpu().numpy()
         mask = legal_action_mask(self.board)
-        
+
         # Compute position reward (after move)
         if use_shaped_reward:
             eval_after = self.evaluate_position(self.board, depth=stockfish_depth)
-            # Improvement in position = reward (from white's perspective)
             position_reward = (eval_after - eval_before) * shaped_reward_coef
+            self._prev_eval = eval_after  # Cache for next step
         
         # Determine termination status
         terminated = self.board.is_game_over(claim_draw=True)

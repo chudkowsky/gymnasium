@@ -306,10 +306,22 @@ class ChessEnv(gym.Env):
         result = None
 
         if use_accuracy_reward:
-            # Per-move accuracy in [0, 1]; no terminal signal
+            # Per-move accuracy in [0, 1] PLUS terminal outcome signal.
+            # Without the terminal reward the agent never learns that losing is bad —
+            # every move still gets a positive accuracy reward even in losing games.
             played_cp = self._evaluate_cp(self.board, depth=stockfish_depth)
             accuracy_reward = self._accuracy_from_cp(best_cp, played_cp)
-            reward = accuracy_reward
+            if terminated:
+                outcome = self.board.outcome()
+                if outcome is not None and outcome.winner == chess.WHITE:
+                    terminal_reward = 1.0
+                    result = 'white_win'
+                elif outcome is not None and outcome.winner == chess.BLACK:
+                    terminal_reward = -1.0
+                    result = 'black_win'
+                else:
+                    result = 'draw'
+            reward = accuracy_reward + terminal_reward
         else:
             # Terminal reward
             if terminated:

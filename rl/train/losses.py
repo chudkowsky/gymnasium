@@ -63,6 +63,38 @@ def compute_value_loss(
     return value_loss
 
 
+def compute_kl_penalty(
+    current_logits: torch.Tensor,
+    ref_logits: torch.Tensor,
+    masks: torch.Tensor,
+) -> torch.Tensor:
+    """
+    KL divergence from current policy to frozen reference policy.
+
+    KL(π_current || π_ref) penalises the policy for drifting too far from the
+    pretrained distribution, preventing catastrophic forgetting.
+
+    Args:
+        current_logits: (N, 4100) logits from current (trainable) policy
+        ref_logits:     (N, 4100) logits from frozen reference policy
+        masks:          (N, 4100) legal action masks
+
+    Returns:
+        kl: scalar mean KL divergence
+    """
+    masked_current = current_logits.clone()
+    masked_ref = ref_logits.clone()
+    masked_current[masks == 0] = -float('inf')
+    masked_ref[masks == 0] = -float('inf')
+
+    current_probs = torch.softmax(masked_current, dim=-1)
+    ref_probs = torch.softmax(masked_ref, dim=-1)
+
+    # KL(current || ref) = Σ current * log(current / ref)
+    kl = (current_probs * (torch.log(current_probs + 1e-10) - torch.log(ref_probs + 1e-10))).sum(dim=-1)
+    return kl.mean()
+
+
 def compute_entropy_loss(
     logits: torch.Tensor,
     masks: torch.Tensor,

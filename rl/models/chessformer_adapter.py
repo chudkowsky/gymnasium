@@ -30,30 +30,65 @@ class ChessformerAdapter(nn.Module):
     - Output: (B, 4100) - logits over discrete actions
     """
     
-    def __init__(self, chessformer_model: nn.Module, device: str = 'cpu'):
+    def __init__(self, chessformer_model: nn.Module, device: str = 'cpu', n_frozen_layers: int = 10):
         """
         Initialize adapter with pretrained ChessTransformer.
-        
+
         Args:
             chessformer_model: Trained ChessTransformer instance
             device: torch device
+            n_frozen_layers: how many of the 12 encoder layers to freeze (default: 10,
+                             so only layers 10-11 and linear_output are fine-tuned)
         """
         super().__init__()
         self.transformer = chessformer_model.to(device)
         self.device = torch.device(device)
-        self.transformer.train()  # Enable training mode for fine-tuning
-        
-        # Enable gradient flow through transformer for fine-tuning
+
+        # --- Layer freezing ---
+        # Freeze everything first, then selectively unfreeze the last few encoder
+        # layers + the output projection. This prevents RL's noisy gradients from
+        # destroying the pretrained chess knowledge baked into earlier layers.
         for param in self.transformer.parameters():
+            param.requires_grad = False
+
+        # Unfreeze last (12 - n_frozen_layers) encoder layers
+        n_total = 12
+        for i in range(n_frozen_layers, n_total):
+            for param in self.transformer.transformer_encoder.layers[i].parameters():
+                param.requires_grad = True
+
+        # Always fine-tune the output projection (it maps to our action space)
+        for param in self.transformer.linear_output.parameters():
             param.requires_grad = True
-        
-        # Add trainable value head on top of transformer features
-        # Use the output dimension from transformer
+
+        n_trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
+        n_total_params = sum(p.numel() for p in self.transformer.parameters())
+        print(f"  Transformer: {n_trainable:,} / {n_total_params:,} params trainable "
+              f"(layers {n_frozen_layers}-11 + linear_output)")
+
+        # --- Value head with rich hidden-state features ---
+        # Hook the last encoder layer to capture its (B, 64, d_model) output,
+        # which is far richer than the raw (B, 64, 2) scores used before.
+        self._last_hidden: torch.Tensor | None = None
+        self._hook_handle = None
+        self._register_hidden_hook()
+        d_model = 512  # known from ChessTransformer architecture
         self.value_head = nn.Sequential(
-            nn.Linear(128, 64),  # Match transformer feature dim
+            nn.Linear(d_model, 256),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(256, 1),
         ).to(device)
+
+    def _register_hidden_hook(self) -> None:
+        """Register (or re-register) the forward hook that captures the last
+        encoder layer's hidden state for the value head.  Must be called after
+        deepcopy because PyTorch does not preserve hooks across deepcopy."""
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+        self._last_hidden = None
+        self._hook_handle = self.transformer.transformer_encoder.layers[-1].register_forward_hook(
+            lambda _m, _i, o: setattr(self, '_last_hidden', o)
+        )
     
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -86,9 +121,10 @@ class ChessformerAdapter(nn.Module):
         # Convert (B, 64, 2) to (B, 4100) logits
         logits = self._scores_to_logits(output)  # (B, 4100)
 
-        # Value head: use full transformer output reshaped as features
-        # output is (B, 64, 2) -> reshape to (B, 128) for value head
-        features = output.reshape(batch_size, -1)  # (B, 128)
+        # Value head: use pooled last-encoder-layer hidden state (B, 64, 512)
+        # captured by the forward hook — much richer than the raw (B, 64, 2) scores.
+        hidden = self._last_hidden  # (B, 64, 512)
+        features = hidden.mean(dim=1)  # (B, 512) — global average pool over squares
         values = self.value_head(features).squeeze(-1)  # (B,)
 
         return logits, values

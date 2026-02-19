@@ -6,9 +6,11 @@ import json
 from typing import Dict, Any
 import numpy as np
 
+import copy
+
 from rl.rollouts import RolloutCollector, ParallelRolloutCollector
 from rl.opponents import OpponentBase
-from .losses import compute_policy_loss, compute_value_loss, compute_entropy_loss
+from .losses import compute_policy_loss, compute_value_loss, compute_entropy_loss, compute_kl_penalty
 
 
 class PPOTrainer:
@@ -44,12 +46,28 @@ class PPOTrainer:
         self.clip_ratio = config.get('clip_ratio', 0.2)
         self.entropy_coef = config.get('entropy_coef', 0.01)
         self.value_coef = config.get('value_coef', 0.5)
+        self.kl_coef = config.get('kl_coef', 0.1)
         self.gamma = config.get('gamma', 0.99)
         self.gae_lambda = config.get('gae_lambda', 0.95)
         self.max_grad_norm = config.get('max_grad_norm', 0.5)
-        
-        # Optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=self.learning_rate)
+
+        # Frozen reference policy for KL penalty — deep copy taken at init time
+        # so the penalty always measures drift from the original pretrained weights.
+        if self.kl_coef > 0:
+            self.ref_policy = copy.deepcopy(policy)
+            for param in self.ref_policy.parameters():
+                param.requires_grad = False
+            self.ref_policy.eval()
+            # deepcopy doesn't preserve forward hooks — re-register on the copy
+            if hasattr(self.ref_policy, 'adapter'):
+                self.ref_policy.adapter._register_hidden_hook()
+            print(f"  KL penalty enabled (coef={self.kl_coef}) — reference policy frozen")
+        else:
+            self.ref_policy = None
+
+        # Optimizer — only update trainable params
+        trainable = [p for p in self.policy.parameters() if p.requires_grad]
+        self.optimizer = optim.Adam(trainable, lr=self.learning_rate)
         
         # Collector configuration
         if collector_config is None:
@@ -186,15 +204,28 @@ class PPOTrainer:
                     old_logprobs_batch, masks_batch,
                     clip_ratio=self.clip_ratio
                 )
-                
+
                 value_loss = compute_value_loss(
                     values.squeeze(-1), returns_batch
                 )
-                
+
                 entropy_loss = compute_entropy_loss(logits, masks_batch)
-                
+
+                # KL penalty: keeps policy close to pretrained reference
+                kl_loss = torch.tensor(0.0, device=self.device)
+                if self.ref_policy is not None:
+                    with torch.no_grad():
+                        ref_output = self.ref_policy.forward(obs_batch)
+                        ref_logits = ref_output[0] if isinstance(ref_output, tuple) else ref_output
+                    kl_loss = compute_kl_penalty(logits, ref_logits, masks_batch)
+
                 # Total loss
-                loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
+                loss = (
+                    policy_loss
+                    + self.value_coef * value_loss
+                    + self.entropy_coef * entropy_loss
+                    + self.kl_coef * kl_loss
+                )
                 
                 # Backprop
                 self.optimizer.zero_grad()
@@ -206,6 +237,7 @@ class PPOTrainer:
                 metrics['policy_loss'] = policy_loss.item()
                 metrics['value_loss'] = value_loss.item()
                 metrics['entropy_loss'] = entropy_loss.item()
+                metrics['kl_loss'] = kl_loss.item()
                 metrics['total_loss'] = loss.item()
                 metrics['approx_kl'] = approx_kl.item()
         

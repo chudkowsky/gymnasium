@@ -1,0 +1,15 @@
+[project]
+name = "chess-rl"
+version = "0.1.0"
+description = "PPO RL training framework for chess using Chessformer"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chessformer",
+    "gymnasium>=0.28.0",
+    "numpy>=1.21.0",
+    "python-chess>=1.9.4",
+]
+
+[tool.uv.sources]
+chessformer = { git = "https://github.com/chudkowsky/chessformer.git" }
